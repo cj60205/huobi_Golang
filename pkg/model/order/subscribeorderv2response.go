@@ -23,6 +23,7 @@ type SubscribeOrderV2Response struct {
 		TradeTime       int64  `json:"tradeTime"`
 		Aggressor       bool   `json:"aggressor"`
 		RemainAmt       string `json:"remainAmt"`
+		ExecAmt         string `json:"execAmt"`
 		LastActTime     int64  `json:"lastActTime"`
 		ErrorCode       int    `json:"errCode"`
 		ErrorMessage    string `json:"errMessage"`

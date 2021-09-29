@@ -2,6 +2,9 @@ package websocketclientbase
 
 import (
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/gorilla/websocket"
 	"github.com/huobirdcenter/huobi_golang/internal/gzip"
 	"github.com/huobirdcenter/huobi_golang/internal/model"
@@ -9,8 +12,6 @@ import (
 	"github.com/huobirdcenter/huobi_golang/logging/applogger"
 	"github.com/huobirdcenter/huobi_golang/pkg/model/auth"
 	"github.com/huobirdcenter/huobi_golang/pkg/model/base"
-	"sync"
-	"time"
 )
 
 const (
@@ -33,6 +34,7 @@ type WebSocketV2ClientBase struct {
 	stopTickerChannel chan int
 	ticker            *time.Ticker
 	lastReceivedTime  time.Time
+	mutex             *sync.Mutex
 	sendMutex         *sync.Mutex
 
 	requestBuilder *requestbuilder.WebSocketV2RequestBuilder
@@ -44,6 +46,7 @@ func (p *WebSocketV2ClientBase) Init(accessKey string, secretKey string, host st
 	p.stopReadChannel = make(chan int, 1)
 	p.stopTickerChannel = make(chan int, 1)
 	p.requestBuilder = new(requestbuilder.WebSocketV2RequestBuilder).Init(accessKey, secretKey, host, websocketV2Path)
+	p.mutex = &sync.Mutex{}
 	p.sendMutex = &sync.Mutex{}
 	return p
 }
@@ -58,11 +61,11 @@ func (p *WebSocketV2ClientBase) SetHandler(authHandler AuthenticationV2ResponseH
 // Connect to websocket server
 // if autoConnect is true, then the connection can be re-connect if no data received after the pre-defined timeout
 func (p *WebSocketV2ClientBase) Connect(autoConnect bool) {
-	// initialize last received time as now
-	p.lastReceivedTime = time.Now()
-
 	// connect to websocket
 	p.connectWebSocket()
+
+	// start loop to read and handle message
+	p.startReadLoop()
 
 	// start ticker to manage connection
 	if autoConnect {
@@ -88,43 +91,41 @@ func (p *WebSocketV2ClientBase) Send(data string) {
 
 // Close the connection to server
 func (p *WebSocketV2ClientBase) Close() {
+	p.stopReadLoop()
 	p.stopTicker()
 	p.disconnectWebSocket()
 }
 
 // connect to server
-func (p *WebSocketV2ClientBase) connectWebSocket() {
+func (p *WebSocketV2ClientBase) connectWebSocket() bool {
 	var err error
+
 	url := fmt.Sprintf("wss://%s%s", p.host, websocketV2Path)
 	applogger.Debug("WebSocket connecting...")
 	p.conn, _, err = websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		applogger.Error("WebSocket connected error: %s", err)
-		return
+		return false
 	}
 	applogger.Info("WebSocket connected")
 
-	// start loop to read and handle message
-	p.startReadLoop()
-
-	// send authentication if connect to websocket successfully
 	auth, err := p.requestBuilder.Build()
 	if err != nil {
 		applogger.Error("Signature generated error: %s", err)
-		return
+		return false
 	}
+
 	p.Send(auth)
-	applogger.Info("WebSocket sent authentication")
+	return true
 }
 
 // disconnect with server
 func (p *WebSocketV2ClientBase) disconnectWebSocket() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
 	if p.conn == nil {
 		return
 	}
-
-	// start a new goroutine to send stop signal
-	go p.stopReadLoop()
 
 	applogger.Debug("WebSocket disconnecting...")
 	err := p.conn.Close()
@@ -163,14 +164,19 @@ func (p *WebSocketV2ClientBase) tickerLoop() {
 
 		// Receive tick from tickChannel
 		case <-p.ticker.C:
+			p.mutex.Lock()
 			elapsedSecond := time.Now().Sub(p.lastReceivedTime).Seconds()
+			p.mutex.Unlock()
 			applogger.Debug("WebSocket received data %f sec ago", elapsedSecond)
 
+			p.mutex.Lock()
 			if elapsedSecond > ReconnectWaitSecond {
-				applogger.Info("WebSocket reconnect...")
+				applogger.Warn("WebSocket reconnect...")
 				p.disconnectWebSocket()
-				p.connectWebSocket()
+				// reset last received time as now
+				p.lastReceivedTime = time.Now()
 			}
+			p.mutex.Unlock()
 		}
 	}
 }
@@ -189,6 +195,7 @@ func (p *WebSocketV2ClientBase) stopReadLoop() {
 // it will stop once it receives the signal from stopReadChannel
 func (p *WebSocketV2ClientBase) readLoop() {
 	applogger.Debug("readLoop started")
+	var reading = true
 	for {
 		select {
 		// Receive data from stopChannel
@@ -197,20 +204,26 @@ func (p *WebSocketV2ClientBase) readLoop() {
 			return
 
 		default:
-			if p.conn == nil {
+			if p.conn == nil || !reading {
 				applogger.Error("Read error: no connection available")
-				time.Sleep(TimerIntervalSecond * time.Second)
+				for !p.connectWebSocket() {
+					time.Sleep(TimerIntervalSecond * time.Second)
+				}
+				reading = true
 				continue
 			}
 
 			msgType, buf, err := p.conn.ReadMessage()
 			if err != nil {
 				applogger.Error("Read error: %s", err)
-				time.Sleep(TimerIntervalSecond * time.Second)
+				p.disconnectWebSocket()
+				reading = false
 				continue
 			}
 
+			p.mutex.Lock()
 			p.lastReceivedTime = time.Now()
+			p.mutex.Unlock()
 
 			// decompress gzip data if it is binary message
 			var message string
