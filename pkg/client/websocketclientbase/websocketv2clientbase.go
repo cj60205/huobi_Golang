@@ -25,6 +25,7 @@ type AuthenticationV2ResponseHandler func(resp *auth.WebSocketV2AuthenticationRe
 type WebSocketV2ClientBase struct {
 	host string
 	conn *websocket.Conn
+	tag  string
 
 	authenticationResponseHandler AuthenticationV2ResponseHandler
 	messageHandler                MessageHandler
@@ -60,7 +61,10 @@ func (p *WebSocketV2ClientBase) SetHandler(authHandler AuthenticationV2ResponseH
 
 // Connect to websocket server
 // if autoConnect is true, then the connection can be re-connect if no data received after the pre-defined timeout
-func (p *WebSocketV2ClientBase) Connect(autoConnect bool) {
+func (p *WebSocketV2ClientBase) Connect(autoConnect bool, tag string) {
+	// set tag
+	p.tag = fmt.Sprintf("[%s]", tag)
+
 	// connect to websocket
 	p.connectWebSocket()
 
@@ -71,12 +75,13 @@ func (p *WebSocketV2ClientBase) Connect(autoConnect bool) {
 	if autoConnect {
 		p.startTicker()
 	}
+
 }
 
 // Send data to websocket server
 func (p *WebSocketV2ClientBase) Send(data string) {
 	if p.conn == nil {
-		applogger.Error("WebSocket sent error: no connection available")
+		applogger.Error("%s WebSocket sent error: no connection available", p.tag)
 		return
 	}
 
@@ -85,7 +90,7 @@ func (p *WebSocketV2ClientBase) Send(data string) {
 	p.sendMutex.Unlock()
 
 	if err != nil {
-		applogger.Error("WebSocket sent error: data=%s, error=%s", data, err)
+		applogger.Error("%s WebSocket sent error: data=%s, error=%s", p.tag, data, err)
 	}
 }
 
@@ -101,17 +106,17 @@ func (p *WebSocketV2ClientBase) connectWebSocket() bool {
 	var err error
 
 	url := fmt.Sprintf("wss://%s%s", p.host, websocketV2Path)
-	applogger.Debug("WebSocket connecting...")
+	applogger.Debug("%s WebSocket connecting...", p.tag)
 	p.conn, _, err = websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
-		applogger.Error("WebSocket connected error: %s", err)
+		applogger.Error("%s WebSocket connected error: %s", p.tag, err)
 		return false
 	}
-	applogger.Info("WebSocket connected")
+	applogger.Info("%s WebSocket connected", p.tag)
 
 	auth, err := p.requestBuilder.Build()
 	if err != nil {
-		applogger.Error("Signature generated error: %s", err)
+		applogger.Error("%s Signature generated error: %s", p.tag, err)
 		return false
 	}
 
@@ -127,14 +132,14 @@ func (p *WebSocketV2ClientBase) disconnectWebSocket() {
 		return
 	}
 
-	applogger.Debug("WebSocket disconnecting...")
+	applogger.Debug("%s WebSocket disconnecting...", p.tag)
 	err := p.conn.Close()
 	if err != nil {
-		applogger.Error("WebSocket disconnect error: %s", err)
+		applogger.Error("%s WebSocket disconnect error: %s", p.tag, err)
 		return
 	}
 
-	applogger.Info("WebSocket disconnected")
+	applogger.Info("%s WebSocket disconnected", p.tag)
 }
 
 // initialize a ticker and start a goroutine tickerLoop()
@@ -154,12 +159,12 @@ func (p *WebSocketV2ClientBase) stopTicker() {
 // It checks the last data that received from server, if it is longer than the threshold,
 // it will force disconnect server and connect again.
 func (p *WebSocketV2ClientBase) tickerLoop() {
-	applogger.Debug("tickerLoop started")
+	applogger.Debug("%s tickerLoop started", p.tag)
 	for {
 		select {
 		// start a goroutine readLoop()
 		case <-p.stopTickerChannel:
-			applogger.Debug("tickerLoop stopped")
+			applogger.Debug("%s tickerLoop stopped", p.tag)
 			return
 
 		// Receive tick from tickChannel
@@ -167,11 +172,11 @@ func (p *WebSocketV2ClientBase) tickerLoop() {
 			p.mutex.Lock()
 			elapsedSecond := time.Now().Sub(p.lastReceivedTime).Seconds()
 			p.mutex.Unlock()
-			applogger.Debug("WebSocket received data %f sec ago", elapsedSecond)
+			applogger.Debug("%s WebSocket received data %f sec ago", p.tag, elapsedSecond)
 
 			p.mutex.Lock()
 			if elapsedSecond > ReconnectWaitSecond {
-				applogger.Warn("WebSocket reconnect...")
+				applogger.Warn("%s WebSocket reconnect...", p.tag)
 				p.disconnectWebSocket()
 				// reset last received time as now
 				p.lastReceivedTime = time.Now()
@@ -194,18 +199,18 @@ func (p *WebSocketV2ClientBase) stopReadLoop() {
 // defines a for loop to read data from server
 // it will stop once it receives the signal from stopReadChannel
 func (p *WebSocketV2ClientBase) readLoop() {
-	applogger.Debug("readLoop started")
+	applogger.Debug("%s readLoop started", p.tag)
 	var reading = true
 	for {
 		select {
 		// Receive data from stopChannel
 		case <-p.stopReadChannel:
-			applogger.Debug("readLoop stopped")
+			applogger.Debug("%s readLoop stopped", p.tag)
 			return
 
 		default:
 			if p.conn == nil || !reading {
-				applogger.Error("Read error: no connection available")
+				applogger.Error("%s Read error: no connection available", p.tag)
 				for !p.connectWebSocket() {
 					time.Sleep(TimerIntervalSecond * time.Second)
 				}
@@ -215,7 +220,7 @@ func (p *WebSocketV2ClientBase) readLoop() {
 
 			msgType, buf, err := p.conn.ReadMessage()
 			if err != nil {
-				applogger.Error("Read error: %s", err)
+				applogger.Error("%s Read error: %s", p.tag, err)
 				p.disconnectWebSocket()
 				reading = false
 				continue
@@ -230,7 +235,7 @@ func (p *WebSocketV2ClientBase) readLoop() {
 			if msgType == websocket.BinaryMessage {
 				message, err = gzip.GZipDecompress(buf)
 				if err != nil {
-					applogger.Error("UnGZip data error: %s", err)
+					applogger.Error("%s UnGZip data error: %s", p.tag, err)
 					return
 				}
 			} else if msgType == websocket.TextMessage {
@@ -241,10 +246,10 @@ func (p *WebSocketV2ClientBase) readLoop() {
 			// If it is Ping then respond Pong
 			pingV2Msg := model.ParsePingV2Message(message)
 			if pingV2Msg.IsPing() {
-				applogger.Debug("Received Ping: %d", pingV2Msg.Data.Timestamp)
+				applogger.Debug("%s Received Ping: %d", p.tag, pingV2Msg.Data.Timestamp)
 				pongMsg := fmt.Sprintf("{\"action\": \"pong\", \"data\": { \"ts\": %d } }", pingV2Msg.Data.Timestamp)
 				p.Send(pongMsg)
-				applogger.Debug("Respond  Pong: %d", pingV2Msg.Data.Timestamp)
+				applogger.Debug("%s Respond Pong: %d", p.tag, pingV2Msg.Data.Timestamp)
 			} else {
 				// Try to pass as websocket v2 authentication response
 				// If it is then invoke authentication handler
@@ -261,7 +266,7 @@ func (p *WebSocketV2ClientBase) readLoop() {
 						{
 							result, err := p.messageHandler(message)
 							if err != nil {
-								applogger.Error("Handle message error: %s", err)
+								applogger.Error("%s Handle message error: %s", p.tag, err)
 								continue
 							}
 							if p.responseHandler != nil {
