@@ -142,9 +142,22 @@ func (p *WebSocketV2ClientBase) disconnectWebSocket() {
 	applogger.Info("%s WebSocket disconnected", p.tag)
 }
 
+func (p *WebSocketV2ClientBase) getLastReceivedTime() time.Time {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.lastReceivedTime
+}
+
+func (p *WebSocketV2ClientBase) setLastReceivedTime(t time.Time) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.lastReceivedTime = t
+}
+
 // initialize a ticker and start a goroutine tickerLoop()
 func (p *WebSocketV2ClientBase) startTicker() {
 	p.ticker = time.NewTicker(TimerIntervalSecond * time.Second)
+	p.setLastReceivedTime(time.Now())
 
 	go p.tickerLoop()
 }
@@ -169,19 +182,16 @@ func (p *WebSocketV2ClientBase) tickerLoop() {
 
 		// Receive tick from tickChannel
 		case <-p.ticker.C:
-			p.mutex.Lock()
-			elapsedSecond := time.Now().Sub(p.lastReceivedTime).Seconds()
-			p.mutex.Unlock()
+			elapsedSecond := time.Since(p.getLastReceivedTime()).Seconds()
 			applogger.Debug("%s WebSocket received data %f sec ago", p.tag, elapsedSecond)
 
-			p.mutex.Lock()
 			if elapsedSecond > ReconnectWaitSecond {
 				applogger.Warn("%s WebSocket reconnect...", p.tag)
 				p.disconnectWebSocket()
+				time.Sleep(TimerIntervalSecond * time.Second)
 				// reset last received time as now
-				p.lastReceivedTime = time.Now()
+				p.setLastReceivedTime(time.Now())
 			}
-			p.mutex.Unlock()
 		}
 	}
 }
@@ -223,12 +233,11 @@ func (p *WebSocketV2ClientBase) readLoop() {
 				applogger.Error("%s Read error: %s", p.tag, err)
 				p.disconnectWebSocket()
 				reading = false
+				time.Sleep(TimerIntervalSecond * time.Second)
 				continue
 			}
 
-			p.mutex.Lock()
-			p.lastReceivedTime = time.Now()
-			p.mutex.Unlock()
+			p.setLastReceivedTime(time.Now())
 
 			// decompress gzip data if it is binary message
 			var message string
